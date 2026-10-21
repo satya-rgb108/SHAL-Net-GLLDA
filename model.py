@@ -66,74 +66,83 @@ class DepScp_Conv(nn.Module):
 
 
 class GLLDA(nn.Module):
-    """Lightweight global-local feature refinement module.
+    """Ablation-ready global/local feature refinement module.
 
-    Global path:
-        Global average pooling -> channel-wise parameter generator ->
-        channel attention + FiLM modulation (gamma and beta).
+    Modes:
+        full   : global branch + local branch + fusion (default)
+        global : global branch only
+        local  : local branch only
+        none   : identity; disables GLLDA
 
-    Local path:
-        Depthwise-separable convolution -> spatial attention.
-
-    Fusion:
-        Concatenate global/local features -> 1x1 convolution -> scaled residual.
-
-    Input and output shapes are both [B, channels, H, W].
+    Disabled branches are not instantiated, so parameter counts reflect
+    the active architecture.
     """
 
-    def __init__(self, channels=64):
+    VALID_MODES = {"full", "global", "local", "none"}
+
+    def __init__(self, channels=64, mode="full"):
         super(GLLDA, self).__init__()
+
+        if mode not in self.VALID_MODES:
+            raise ValueError(
+                f"Invalid GLLDA mode {mode!r}. Choose from {sorted(self.VALID_MODES)}."
+            )
+
+        self.mode = mode
         hidden = max(channels // 4, 8)
 
-        # Global context and channel-wise conditioning.
-        self.global_pool = nn.AdaptiveAvgPool2d(1)
-        self.global_mlp = nn.Sequential(
-            nn.Conv2d(channels, hidden, kernel_size=1),
-            nn.ReLU(inplace=True),
-            nn.Conv2d(hidden, channels * 3, kernel_size=1),
-        )
+        if mode in {"full", "global"}:
+            self.global_pool = nn.AdaptiveAvgPool2d(1)
+            self.global_mlp = nn.Sequential(
+                nn.Conv2d(channels, hidden, kernel_size=1),
+                nn.ReLU(inplace=True),
+                nn.Conv2d(hidden, channels * 3, kernel_size=1),
+            )
 
-        # Local texture/detail features with lightweight convolutions.
-        self.local_conv = DepScp_Conv(channels, channels)
-        self.local_act = nn.LeakyReLU(negative_slope=0.01, inplace=True)
+        if mode in {"full", "local"}:
+            self.local_conv = DepScp_Conv(channels, channels)
+            self.local_act = nn.LeakyReLU(negative_slope=0.01, inplace=True)
+            self.spatial_attention = nn.Conv2d(
+                in_channels=2, out_channels=1, kernel_size=7,
+                stride=1, padding=3,
+            )
 
-        # Spatial attention uses channel-wise average and maximum maps.
-        self.spatial_attention = nn.Conv2d(
-            in_channels=2,
-            out_channels=1,
-            kernel_size=7,
-            stride=1,
-            padding=3,
-        )
-        self.sigmoid = nn.Sigmoid()
+        if mode == "full":
+            self.fusion = nn.Conv2d(channels * 2, channels, kernel_size=1)
 
-        # Feature fusion and a conservative residual update.
-        self.fusion = nn.Conv2d(channels * 2, channels, kernel_size=1)
-        self.residual_scale = nn.Parameter(torch.tensor(0.1))
+        if mode != "none":
+            self.residual_scale = nn.Parameter(torch.tensor(0.1))
 
-    def forward(self, x):
-        # ----- Global branch: channel attention + FiLM -----
-        global_context = self.global_pool(x)             # [B, C, 1, 1]
-        global_params = self.global_mlp(global_context)  # [B, 3C, 1, 1]
+    def _global_forward(self, x):
+        global_context = self.global_pool(x)
+        global_params = self.global_mlp(global_context)
         channel_logits, delta_gamma, beta = torch.chunk(
             global_params, chunks=3, dim=1
         )
-
-        channel_weights = self.sigmoid(channel_logits)   # [B, C, 1, 1]
-        delta_gamma = 0.1 * torch.tanh(delta_gamma)      # bounded modulation
-        beta = 0.1 * torch.tanh(beta)                    # bounded modulation
+        channel_weights = torch.sigmoid(channel_logits)
+        delta_gamma = 0.1 * torch.tanh(delta_gamma)
+        beta = 0.1 * torch.tanh(beta)
         film_features = (1.0 + delta_gamma) * x + beta
-        global_features = channel_weights * film_features
+        return channel_weights * film_features
 
-        # ----- Local branch: depthwise CNN + spatial attention -----
+    def _local_forward(self, x):
         local_features = self.local_act(self.local_conv(x))
         avg_map = torch.mean(local_features, dim=1, keepdim=True)
         max_map = torch.max(local_features, dim=1, keepdim=True)[0]
         spatial_input = torch.cat([avg_map, max_map], dim=1)
-        spatial_weights = self.sigmoid(self.spatial_attention(spatial_input))
-        local_features = local_features * spatial_weights
+        spatial_weights = torch.sigmoid(self.spatial_attention(spatial_input))
+        return local_features * spatial_weights
 
-        # ----- Fusion: retain the original features through a residual -----
+    def forward(self, x):
+        if self.mode == "none":
+            return x
+        if self.mode == "global":
+            return x + self.residual_scale * self._global_forward(x)
+        if self.mode == "local":
+            return x + self.residual_scale * self._local_forward(x)
+
+        global_features = self._global_forward(x)
+        local_features = self._local_forward(x)
         combined = torch.cat([global_features, local_features], dim=1)
         fused = self.fusion(combined)
         return x + self.residual_scale * fused
@@ -196,7 +205,7 @@ class DecomNet(nn.Module):
     original SHAL-Net train.py and loss.py.
     """
 
-    def __init__(self):
+    def __init__(self, gll_da_mode="full"):
         super(DecomNet, self).__init__()
         filters = 64
         self.SCR = SCR()
@@ -211,7 +220,7 @@ class DecomNet(nn.Module):
         self.conv6 = Conv(filters * 2, filters)
 
         # New module: refines x6 using global and local information.
-        self.gll_da = GLLDA(channels=filters)
+        self.gll_da = GLLDA(channels=filters, mode=gll_da_mode)
 
         # Output layout remains 4 channels: 3 for reflectance R, 1 for illumination L.
         self.conv7 = Conv(filters * 2, 4)
